@@ -150,6 +150,191 @@ class TypedDictTests(BaseTestCase):
         self.assertEqual(Options.__total__, False)  # noqa
 
 
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", category=DeprecationWarning)
+
+    TotalBase = TypedDict('TotalBase', {'x': int})
+    OptionalBase = TypedDict('OptionalBase', {'y': str}, total=False)
+
+    class TotalSub(OptionalBase, total=True):
+        z: float
+
+    class OptionalSub(TotalBase, total=False):
+        z: float
+
+    class LevelA(TypedDict):
+        a: int
+
+    class LevelB(LevelA):
+        b: str
+
+    class LevelC(LevelB):
+        c: float
+
+
+class TypedDictConsistencyTests(BaseTestCase):
+    @contextmanager
+    def ignore_typeddict_deprecation(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=DeprecationWarning)
+            yield
+
+    @contextmanager
+    def assert_typeddict_deprecated(self):
+        with self.assertWarnsRegex(
+            DeprecationWarning, "mypy_extensions.TypedDict is deprecated"
+        ):
+            yield
+
+    def test_total_false_subclass_of_total_base(self):
+        # The explicit total of the subclass wins over the base's total.
+        self.assertEqual(OptionalSub.__total__, False)  # noqa
+        self.assertEqual(OptionalSub.__annotations__, {'x': int, 'z': float})  # noqa
+        self.assertEqual(OptionalSub(), {})
+
+    def test_total_true_subclass_of_optional_base(self):
+        self.assertEqual(TotalSub.__total__, True)  # noqa
+        self.assertEqual(TotalSub.__annotations__, {'y': str, 'z': float})  # noqa
+
+    def test_total_defaults_to_true_and_is_not_inherited(self):
+        with self.ignore_typeddict_deprecation():
+            class Sub(OptionalBase):
+                w: int
+        # total comes solely from this declaration; the base's
+        # total=False is not inherited.
+        self.assertEqual(Sub.__total__, True)
+        self.assertEqual(Sub.__annotations__, {'y': str, 'w': int})
+
+    def test_functional_base_total_not_inherited(self):
+        with self.ignore_typeddict_deprecation():
+            FuncBase = TypedDict('FuncBase', {'x': int}, total=False)
+
+            class Sub(FuncBase):
+                pass
+        self.assertEqual(FuncBase.__total__, False)
+        self.assertEqual(Sub.__total__, True)
+        self.assertEqual(Sub.__annotations__, {'x': int})
+
+    def test_multilevel_inheritance(self):
+        self.assertEqual(LevelC.__annotations__, {'a': int, 'b': str, 'c': float})  # noqa
+        self.assertEqual(list(LevelC.__annotations__), ['a', 'b', 'c'])  # noqa
+        self.assertEqual(LevelB.__annotations__, {'a': int, 'b': str})  # noqa
+        self.assertEqual(LevelA.__annotations__, {'a': int})  # noqa
+        self.assertEqual(LevelC.__total__, True)  # noqa
+        inst = LevelC(a=1, b='x', c=2.0)  # noqa
+        self.assertEqual(inst, {'a': 1, 'b': 'x', 'c': 2.0})
+
+    def test_override_field_type_child_wins(self):
+        with self.ignore_typeddict_deprecation():
+            class Sub(TotalBase):
+                x: str
+        # The most derived declaration wins on conflicts...
+        self.assertEqual(Sub.__annotations__, {'x': str})
+        # ...while the base is unaffected.
+        self.assertEqual(TotalBase.__annotations__, {'x': int})  # noqa
+
+    def test_override_field_keeps_declaration_position(self):
+        with self.ignore_typeddict_deprecation():
+            class Base(TypedDict):
+                x: int
+                y: int
+
+            class Sub(Base):
+                x: str
+                z: str
+        self.assertEqual(list(Sub.__annotations__), ['x', 'y', 'z'])
+        self.assertEqual(Sub.__annotations__, {'x': str, 'y': int, 'z': str})
+
+    def test_multiple_bases_later_base_wins(self):
+        with self.ignore_typeddict_deprecation():
+            First = TypedDict('First', {'f': int, 'common': int})
+            Second = TypedDict('Second', {'s': str, 'common': str})
+
+            class Both(First, Second):
+                pass
+        # Stable rule: fields keep base declaration order; for conflicts
+        # between bases the later base wins.
+        self.assertEqual(list(Both.__annotations__), ['f', 'common', 's'])
+        self.assertEqual(Both.__annotations__, {'f': int, 'common': str, 's': str})
+
+    def test_functional_and_class_syntax_equivalence(self):
+        with self.ignore_typeddict_deprecation():
+            Func = TypedDict('Func', {'x': int, 'y': str}, total=False)
+
+            class Klass(TypedDict, total=False):
+                x: int
+                y: str
+        self.assertEqual(Func.__annotations__, Klass.__annotations__)
+        self.assertEqual(Func.__total__, Klass.__total__)
+        self.assertEqual(Func(x=1), Klass(x=1))
+
+    def test_empty_typeddict(self):
+        with self.ignore_typeddict_deprecation():
+            EmptyFunc = TypedDict('EmptyFunc', {})
+
+            class EmptyClass(TypedDict):
+                pass
+        for empty in (EmptyFunc, EmptyClass):
+            self.assertEqual(empty.__annotations__, {})
+            self.assertEqual(empty.__total__, True)
+            self.assertEqual(empty(), {})
+            self.assertIs(type(empty()), dict)
+
+    def test_annotations_isolation(self):
+        with self.ignore_typeddict_deprecation():
+            class Sub(TotalBase):
+                z: float
+        self.assertIsNot(Sub.__annotations__, TotalBase.__annotations__)  # noqa
+        Sub.__annotations__['extra'] = bytes
+        self.assertEqual(TotalBase.__annotations__, {'x': int})  # noqa
+        TotalBase.__annotations__['other'] = bytes  # noqa
+        self.assertNotIn('other', Sub.__annotations__)
+        # Restore global fixtures for other tests.
+        del Sub.__annotations__['extra']
+        del TotalBase.__annotations__['other']  # noqa
+
+    def test_instance_is_plain_dict(self):
+        inst = TotalSub(y='a', z=1.5)  # noqa
+        self.assertIs(type(inst), dict)
+        inst['extra'] = 42
+        inst['y'] = None
+        del inst['z']
+        self.assertEqual(inst, {'y': None, 'extra': 42})
+        self.assertEqual(inst.get('missing', 'd'), 'd')
+        self.assertIn('y', inst)
+
+    def test_no_runtime_value_validation(self):
+        # Values are never checked against the declared types at runtime.
+        inst = TotalSub(y=123, z='not a float')  # noqa
+        self.assertEqual(inst, {'y': 123, 'z': 'not a float'})
+        self.assertEqual(TotalSub(), {})  # noqa
+
+    def test_deprecation_warning_for_derived_classes(self):
+        with self.assert_typeddict_deprecated():
+            class SubOfSub(LevelC):
+                pass
+        with self.assert_typeddict_deprecated():
+            TypedDict('Func', {'x': int})
+
+    def test_invalid_annotation_type_still_raises(self):
+        with self.ignore_typeddict_deprecation():
+            with self.assertRaises(TypeError):
+                TypedDict('BadFunc', {'x': ()})
+            with self.assertRaises(TypeError):
+                class BadClass(TypedDict):
+                    x: ()
+
+    def test_legacy_syntax_forms(self):
+        with self.ignore_typeddict_deprecation():
+            Pairs = TypedDict('Pairs', [('x', int), ('y', str)])
+            Kwargs = TypedDict('Kwargs', x=int, y=str)
+        self.assertEqual(Pairs.__annotations__, {'x': int, 'y': str})
+        self.assertEqual(Kwargs.__annotations__, {'x': int, 'y': str})
+        self.assertEqual(Pairs.__module__, __name__)
+        with self.assertRaises(TypeError), self.ignore_typeddict_deprecation():
+            TypedDict('Both', [('x', int)], y=int)
+
+
 native_int_types = [i64, i32, i16, u8]
 
 

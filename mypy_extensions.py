@@ -42,7 +42,7 @@ def _typeddict_new(cls, _typename, _fields=None, **kwargs):
     except (AttributeError, ValueError):
         pass
 
-    return _TypedDictMeta(_typename, (), ns, _from_functional_call=True)
+    return _TypedDictMeta(_typename, (), ns, total=total, _from_functional_call=True)
 
 
 class _TypedDictMeta(type):
@@ -71,14 +71,33 @@ class _TypedDictMeta(type):
         ns['__new__'] = _typeddict_new if name == 'TypedDict' else _dict_new
         tp_dict = super(_TypedDictMeta, cls).__new__(cls, name, (dict,), ns)
 
-        anns = ns.get('__annotations__', {})
-        msg = "TypedDict('Name', {f0: t0, f1: t1, ...}); each t must be a type"
-        anns = {n: _type_check(tp, msg) for n, tp in anns.items()}
+        # The __total__ of a TypedDict class comes solely from its own
+        # declaration (the `total` argument of this class creation); it is
+        # never inherited from base classes.
+        tp_dict.__total__ = total
+
+        # Merge annotations: base class fields come first, in declaration
+        # order, then this class's own fields. On conflicts the most derived
+        # class wins, while the field keeps the position of its first
+        # declaration. For conflicts between bases, the later base wins.
+        anns = {}
         for base in bases:
-            anns.update(base.__dict__.get('__annotations__', {}))
+            if sys.version_info >= (3, 14):
+                # On 3.14+, __annotations__ set on a class is stored in a
+                # hidden cache slot, so read it through the descriptor.
+                anns.update(getattr(base, '__annotations__', {}))
+            else:
+                anns.update(base.__dict__.get('__annotations__', {}))
+        if sys.version_info >= (3, 14):
+            # PEP 649/749: class-level annotations are lazily evaluated and
+            # are not present in the class namespace; accessing
+            # __annotations__ on the new class materializes its own fields.
+            own_anns = tp_dict.__annotations__
+        else:
+            own_anns = tp_dict.__dict__.get('__annotations__', {})
+        msg = "TypedDict('Name', {f0: t0, f1: t1, ...}); each t must be a type"
+        anns.update({n: _type_check(tp, msg) for n, tp in own_anns.items()})
         tp_dict.__annotations__ = anns
-        if not hasattr(tp_dict, '__total__'):
-            tp_dict.__total__ = total
         return tp_dict
 
     __instancecheck__ = __subclasscheck__ = _check_fails
