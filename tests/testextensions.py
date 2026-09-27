@@ -5,7 +5,22 @@ import typing
 import warnings
 from contextlib import contextmanager
 from unittest import TestCase, main
-from mypy_extensions import TypedDict, i64, i32, i16, u8
+from mypy_extensions import TypedDict, _TypedDictMeta, i64, i32, i16, u8
+
+
+@contextmanager
+def assert_typeddict_deprecated(testcase):
+    with testcase.assertWarnsRegex(
+        DeprecationWarning, "mypy_extensions.TypedDict is deprecated"
+    ):
+        yield
+
+
+@contextmanager
+def ignore_typeddict_deprecation():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=DeprecationWarning)
+        yield
 
 
 class BaseTestCase(TestCase):
@@ -148,6 +163,177 @@ class TypedDictTests(BaseTestCase):
         self.assertEqual(Options(), {})  # noqa
         self.assertEqual(Options(log_level=2), {'log_level': 2})  # noqa
         self.assertEqual(Options.__total__, False)  # noqa
+
+
+class TypedDictContractTests(BaseTestCase):
+    """Contract tests: totality, inheritance and runtime metadata must be
+    consistent between the functional and class syntaxes."""
+
+    def test_functional_total_true_metadata(self):
+        with assert_typeddict_deprecated(self):
+            T = TypedDict('T', {'x': int}, total=True)
+        self.assertEqual(T.__annotations__, {'x': int})
+        self.assertIs(T.__total__, True)
+
+    def test_functional_total_false_metadata(self):
+        with assert_typeddict_deprecated(self):
+            T = TypedDict('T', {'x': int}, total=False)
+        self.assertEqual(T.__annotations__, {'x': int})
+        self.assertIs(T.__total__, False)
+
+    def test_class_total_false_metadata(self):
+        with assert_typeddict_deprecated(self):
+            class T(TypedDict, total=False):
+                x: int
+        self.assertEqual(T.__annotations__, {'x': int})
+        self.assertIs(T.__total__, False)
+
+    def test_total_not_inherited_from_base(self):
+        # A subclass that does not redeclare total= gets total=True,
+        # even if its base is non-total.
+        with ignore_typeddict_deprecation():
+            class Base(TypedDict, total=False):
+                x: int
+            class Child(Base):
+                y: int
+        self.assertIs(Base.__total__, False)
+        self.assertIs(Child.__total__, True)
+        self.assertEqual(Child.__annotations__, {'x': int, 'y': int})
+
+    def test_explicit_total_overrides_total_base(self):
+        with ignore_typeddict_deprecation():
+            class Base(TypedDict):
+                x: int
+            class Child(Base, total=False):
+                y: int
+        self.assertIs(Base.__total__, True)
+        self.assertIs(Child.__total__, False)
+
+    def test_multilevel_inheritance_order_and_types(self):
+        with ignore_typeddict_deprecation():
+            class A(TypedDict):
+                a: int
+            B = TypedDict('B', {'b': str})
+            class C(A, B):
+                c: float
+            class D(C):
+                d: bytes
+        self.assertEqual(list(C.__annotations__), ['a', 'b', 'c'])
+        self.assertEqual(C.__annotations__, {'a': int, 'b': str, 'c': float})
+        self.assertEqual(
+            D.__annotations__, {'a': int, 'b': str, 'c': float, 'd': bytes})
+        self.assertIs(D.__total__, True)
+
+    def test_duplicate_field_child_wins_position_stable(self):
+        # Redeclaring a base field is allowed: the child's type wins and
+        # the field keeps its original (base) position.
+        with ignore_typeddict_deprecation():
+            class Base(TypedDict):
+                x: int
+                y: str
+            class Child(Base):
+                x: str
+        self.assertEqual(Child.__annotations__, {'x': str, 'y': str})
+        self.assertEqual(list(Child.__annotations__), ['x', 'y'])
+        self.assertEqual(Base.__annotations__, {'x': int, 'y': str})
+
+    def test_functional_and_class_syntax_equivalent(self):
+        with ignore_typeddict_deprecation():
+            Func = TypedDict('Func', {'x': int, 'y': str}, total=False)
+            class Klass(TypedDict, total=False):
+                x: int
+                y: str
+        self.assertEqual(Func.__annotations__, Klass.__annotations__)
+        self.assertEqual(Func.__total__, Klass.__total__)
+        self.assertEqual(type(Func), type(Klass))
+        self.assertEqual(Func(x=1, y='a'), Klass(x=1, y='a'))
+
+    def test_empty_fields(self):
+        with ignore_typeddict_deprecation():
+            EmptyFunc = TypedDict('EmptyFunc', {})
+            class EmptyClass(TypedDict):
+                pass
+            class EmptyChild(EmptyClass, total=False):
+                pass
+        self.assertEqual(EmptyFunc.__annotations__, {})
+        self.assertEqual(EmptyClass.__annotations__, {})
+        self.assertEqual(EmptyChild.__annotations__, {})
+        self.assertIs(EmptyFunc.__total__, True)
+        self.assertIs(EmptyChild.__total__, False)
+        self.assertEqual(EmptyFunc(), {})
+
+    def test_field_names_conflicting_with_dict_attrs(self):
+        with ignore_typeddict_deprecation():
+            T = TypedDict('T', {'keys': int, 'total': str, 'items': float})
+        self.assertEqual(
+            T.__annotations__, {'keys': int, 'total': str, 'items': float})
+        self.assertIs(T.__total__, True)
+        inst = T(keys=1, total='a', items=2.0)
+        self.assertEqual(inst, {'keys': 1, 'total': 'a', 'items': 2.0})
+        self.assertEqual(inst['keys'], 1)
+
+    def test_annotations_isolation_between_base_and_child(self):
+        with ignore_typeddict_deprecation():
+            class Base(TypedDict):
+                x: int
+            class Child(Base):
+                y: int
+        self.assertIsNot(Base.__annotations__, Child.__annotations__)
+        Child.__annotations__['z'] = bytes
+        self.assertEqual(Base.__annotations__, {'x': int})
+        self.assertEqual(set(Child.__annotations__), {'x', 'y', 'z'})
+
+    def test_instance_is_plain_mutable_dict_without_validation(self):
+        with ignore_typeddict_deprecation():
+            class Movie(TypedDict):
+                name: str
+                year: int
+        movie = Movie(name='Blade Runner', year=1982)
+        self.assertIs(type(movie), dict)
+        self.assertIsInstance(movie, dict)
+        # No runtime validation of values or keys.
+        movie['year'] = 'not an int'
+        movie['extra'] = object()
+        del movie['name']
+        self.assertNotIn('name', movie)
+        # Missing/extra keys are accepted at runtime.
+        self.assertEqual(Movie(), {})
+        self.assertEqual(Movie(year='x'), {'year': 'x'})
+
+    def test_deprecation_warning_functional_and_class(self):
+        with assert_typeddict_deprecated(self):
+            TypedDict('W', {'x': int})
+        with assert_typeddict_deprecated(self):
+            TypedDict('W2', x=int, total=False)
+        with assert_typeddict_deprecated(self):
+            class W3(TypedDict, total=False):
+                x: int
+
+    def test_legacy_namespace_annotations_path(self):
+        # Pre-3.14 class syntax put __annotations__ directly in the class
+        # namespace; the metaclass must still honor that path.
+        with ignore_typeddict_deprecation():
+            class Base(TypedDict):
+                x: int
+        with assert_typeddict_deprecated(self):
+            Legacy = _TypedDictMeta(
+                'Legacy', (Base,),
+                {'__annotations__': {'y': str}, '__total__': False})
+        self.assertEqual(Legacy.__annotations__, {'x': int, 'y': str})
+        self.assertIs(Legacy.__total__, False)
+        self.assertEqual(Legacy(x=1, y='a'), {'x': 1, 'y': 'a'})
+
+    def test_invalid_types_and_arguments_still_raise(self):
+        with self.assertRaises(TypeError), assert_typeddict_deprecated(self):
+            TypedDict('Hi', {'x': ()})
+        with self.assertRaises(TypeError), assert_typeddict_deprecated(self):
+            TypedDict('Hi', [('x', int), ('y', ())])
+        with self.assertRaises(TypeError):
+            TypedDict('Hi', [('x', int)], y=int)
+        with ignore_typeddict_deprecation():
+            with self.assertRaises(TypeError):
+                class Bad(TypedDict):
+                    x: ()
 
 
 native_int_types = [i64, i32, i16, u8]

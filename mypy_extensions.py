@@ -27,6 +27,23 @@ def _dict_new(cls, *args, **kwargs):
     return dict(*args, **kwargs)
 
 
+# annotationlib.Format.VALUE; hardcoded to keep supporting Python versions
+# without the annotationlib module (added in 3.14).
+_ANNOTATE_FORMAT_VALUE = 1
+
+
+def _get_own_annotations(cls):
+    # Annotations explicitly set on the class, without inheriting from bases.
+    # Python 3.14+ (PEP 649) stores lazily computed annotations in
+    # __annotations_cache__ instead of __annotations__.
+    anns = cls.__dict__.get('__annotations__')
+    if anns is None:
+        anns = cls.__dict__.get('__annotations_cache__')
+    if anns is None:
+        anns = {}
+    return anns
+
+
 def _typeddict_new(cls, _typename, _fields=None, **kwargs):
     total = kwargs.pop('total', True)
     if _fields is None:
@@ -71,14 +88,29 @@ class _TypedDictMeta(type):
         ns['__new__'] = _typeddict_new if name == 'TypedDict' else _dict_new
         tp_dict = super(_TypedDictMeta, cls).__new__(cls, name, (dict,), ns)
 
-        anns = ns.get('__annotations__', {})
+        own_annotations = ns.get('__annotations__')
+        if own_annotations is None:
+            # Python 3.14+ (PEP 649): class bodies with annotations store a
+            # lazy __annotate_func__ in the namespace instead of
+            # __annotations__.
+            annotate = ns.get('__annotate_func__') or ns.get('__annotate__')
+            if callable(annotate):
+                own_annotations = annotate(_ANNOTATE_FORMAT_VALUE)
+            else:
+                own_annotations = {}
         msg = "TypedDict('Name', {f0: t0, f1: t1, ...}); each t must be a type"
-        anns = {n: _type_check(tp, msg) for n, tp in anns.items()}
+        own_annotations = {
+            n: _type_check(tp, msg) for n, tp in own_annotations.items()
+        }
+        anns = {}
         for base in bases:
-            anns.update(base.__dict__.get('__annotations__', {}))
+            anns.update(_get_own_annotations(base))
+        anns.update(own_annotations)
         tp_dict.__annotations__ = anns
-        if not hasattr(tp_dict, '__total__'):
-            tp_dict.__total__ = total
+        # totality is determined solely by this declaration: the total=
+        # keyword for class syntax, or ns['__total__'] set by _typeddict_new
+        # for the functional syntax. It is never inherited from bases.
+        tp_dict.__total__ = ns.get('__total__', total)
         return tp_dict
 
     __instancecheck__ = __subclasscheck__ = _check_fails
